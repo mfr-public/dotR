@@ -1,0 +1,347 @@
+---
+---
+title: "Estimating Population Size with the dotR Package"
+author: "Mark Richardson"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+    theme: united
+  pdf_document:
+    toc: yes
+    number_sections: yes
+vignette: >
+  %\VignetteIndexEntry{Estimating Population Size with dotR}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE) # eval=FALSE for vignette build, set to TRUE to run examples
+# Load necessary packages for the vignette itself
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(scales)
+
+# Attempt to load the dotR package - users will need to adapt this
+# Option 1: If dotR is a proper package and installed
+# if (requireNamespace("dotR", quietly = TRUE)) {
+#   library(dotR)
+#   message("dotR package loaded.")
+# } else {
+#   message("dotR package not found. Please ensure it is installed and accessible.")
+#   # As a fallback for vignette generation without the package fully built/installed,
+#   # you might source the R files directly if they define the functions globally.
+#   # This is NOT recommended for a final package vignette but can help in development.
+#   # if (file.exists("../R/dnadot.R")) { # Adjust path as needed
+#   #   source("../R/dnadot.R")
+#   #   message("Sourced R/dnadot.R for vignette generation.")
+#   # } else {
+#   #   stop("dotR package or source files not found.")
+#   # }
+# }
+
+# For this template, we assume functions like dnadot_snp and df2genind_dotR will be available
+# when the user actually builds/uses the vignette with their package.
+# We'll use placeholder messages if functions aren't found during a simple knit.
+
+check_dotR_function <- function(func_name) {
+  if (!exists(func_name) || !is.function(get(func_name))) {
+    message(paste("Function '", func_name, "' is not available. Examples in this vignette may not run without the dotR package being properly loaded."))
+    return(FALSE)
+  }
+  return(TRUE)
+}
+```
+
+# Introduction
+
+Estimating census population size ($N_c$) is a fundamental task in ecology, evolution, and conservation biology. Accurate $N_c$ estimates are crucial for assessing population status, understanding demographic trends, managing harvested species, and conserving endangered ones. However, obtaining reliable $N_c$ estimates can be challenging, often requiring significant field effort and relying on assumptions that may not always hold true.
+
+The `dotR` package provides tools to estimate census population size from SNP (Single Nucleotide Polymorphism) genotype data using two primary approaches:
+
+1.  **The DnaDot Method:** Based on the methodology described by Sherwin (2024), which uses a mark-release-recapture framework where genetic variants act as intrinsic "marks". This method is available with the original discrepancy metric and new experimental refinements.
+2.  **Maximum Likelihood Estimation (MLE) with AIC:** A likelihood-based approach that seeks to find the population size maximizing the probability of observing the sampled allele counts, often coupled with Akaike Information Criterion (AIC) for model averaging or selection if multiple targets (e.g., different alleles) are analyzed.
+
+This vignette provides a theoretical overview of these methods, details their implementation within the `dotR` package, and offers a user guide with practical examples.
+
+# Theoretical Background
+
+## The DnaDot Method (Sherwin, 2024)
+
+The DnaDot method, introduced by Sherwin (2024, "DnaDot - fixing ecology and evolution's blind spot, population size," *Ecological Indicators*), offers a novel way to estimate $N_c$ from a single sample of individuals. It draws an analogy to traditional mark-release-recapture (MRR) studies but uses naturally occurring genetic polymorphisms as markers.
+
+Key components of the DnaDot method include:
+
+1.  **Genetic "Marks":** Each allele at a SNP locus can be considered a "mark". For a bi-allelic SNP (e.g., alleles A and T), individuals carrying allele A belong to one group, and those with allele T (or lacking A) belong to another.
+2.  **Hypergeometric Probability:** The core statistical model is the hypergeometric distribution. If a population of $N$ (total alleles, i.e., $2 \times N_c$ for diploids) contains $K$ copies of a target allele (where $K = p \times N$, and $p$ is the population proportion of the target allele), the probability of observing $k$ copies of this target allele in a sample of $s$ alleles (from $s/2$ diploid individuals in a subsample) is given by:
+    $$P(X=k) = \frac{\binom{K}{k} \binom{N-K}{s-k}}{\binom{N}{s}}$$
+3.  **Jackknife Resampling:** To generate an observed distribution of allele counts, the total sample of $n$ individuals is divided into multiple overlapping jackknife subsamples. For each subsample of size $j$ individuals (containing $s = j \times \text{ploidy}$ alleles), the number of target alleles is counted. This creates an observed frequency distribution (O) of these counts.
+4.  **Joint Estimation of $N_c$ and $p$:** Both $N_c$ (and thus $N$) and the allele proportion $p$ are typically unknown. The method jointly estimates them by testing a grid of hypothesized $N_c$ values (denoted $N_{try}$) and hypothesized $p$ values ($p_{try}$).
+5.  **Discrepancy Minimization:** For each ($N_{try}$, $p_{try}$) pair, an expected frequency distribution (E) of target allele counts in the jackknife subsamples is calculated using the hypergeometric model. The discrepancy between the observed (O) and expected (E) distributions is calculated. The original method uses the sum of absolute differences: $D_{abs} = \sum_{bins} |O_{bin} - E_{bin}|$. The ($N_{try}$, $p_{try}$) pair that minimizes this discrepancy $D$ provides the estimates $\hat{N_c}$ and $\hat{p}$ for that locus and target allele. (See Section 5 for new discrepancy options).
+6.  **"Folding" Allele Proportions:** To improve accuracy, especially for alleles with extreme frequencies, the analysis is performed twice for each bi-allelic locus: once targeting one allele (e.g., 'A' with proportion $p_A$) and then targeting the alternative allele (e.g., 'T' with proportion $p_T = 1 - p_A$). This effectively doubles the number of "analysis units".
+7.  **Coefficient of Variation (CV) Based Refinement:** The Sherwin (2024) paper proposes a refinement to reduce potential bias. For each analysis unit (locus-allele combination), the coefficient of variation (CV) of the *number of target alleles detected across the jackknife subsamples* is calculated. The final $N_c$ estimate is derived by averaging the $\hat{N_c}$ values from a subset (e.g., the 10%) of analysis units that exhibit the lowest CV, as these are considered the most stable and reliable.
+
+## Maximum Likelihood Estimation (MLE) with AIC
+
+Another approach to estimate $N_c$ is using Maximum Likelihood Estimation.
+
+1.  **Likelihood Function:** Similar to the DnaDot method, the hypergeometric distribution can form the basis of a likelihood function. Given a sample of $n$ diploid individuals, and focusing on a specific target allele at a locus, we can consider the jackknife subsamples. For each subsample $i$ of $j$ individuals (yielding $s = j \times \text{ploidy}$ alleles), if $k_i$ target alleles are observed, the probability is $P(X=k_i | N_c, p, s)$.
+    The total log-likelihood for a given locus (summed over all jackknife subsamples) would be:
+    $$L(N_c, p | \text{data}) = \sum_{i \in \text{subsamples}} \log P(X=k_i | N_c, p, s)$$
+    The allele proportion $p$ in the population can be estimated from the full sample, or treated as a nuisance parameter. The `dotR` package's MLE implementation uses the sample allele frequency from the *entire* sample as an estimate of $p$ when calculating likelihoods for different $N_c$.
+2.  **Optimization:** The MLE for $N_c$ ($\hat{N}_{MLE}$) is the value of $N_c$ that maximizes this likelihood function. This typically involves numerical optimization methods.
+3.  **AIC for Model Averaging/Selection (if applicable):** If the MLE analysis is performed for multiple target alleles (e.g., by treating each allele at a locus, or even different loci, as separate targets for estimation), Akaike's Information Criterion (AIC) can be used to weigh or select among the resulting $N_c$ estimates. AIC is calculated as:
+    $$AIC = 2 \times \text{num_params} - 2 \times \log L$$
+    where `num_params` is the number of estimated parameters in the model (typically 1, for $N_c$, if $p$ is fixed from the sample). AIC weights can be derived as $w_i = \frac{\exp(-\frac{1}{2} \Delta AIC_i)}{\sum_j \exp(-\frac{1}{2} \Delta AIC_j)}$, where $\Delta AIC_i = AIC_i - AIC_{min}$. An AIC-weighted average $N_c$ can then be computed: $\hat{N}_{AIC} = \sum_i w_i \hat{N}_{MLE,i}$. The `dotR` package's MLE method can provide such an AIC-weighted average if multiple target alleles are specified.
+
+# The `dotR` Package
+
+## Installation / Loading
+
+The `dotR` package should be loaded into your R session. If you have the package source, you might use `devtools::load_all(".")` from the package's root directory. If it's installed like a standard R package, use `library(dotR)`.
+
+```{r load_dotR_package_example, eval=FALSE}
+# Option 1: If installed as a package
+# library(dotR)
+
+# Option 2: If loading from source using devtools (run from package root)
+# devtools::load_all()
+
+# Option 3: Sourcing R files directly (less ideal, adjust path)
+# source("R/dnadot.R") # This should also handle Rcpp::sourceCpp for C++ files
+```
+
+## Core Functions
+
+The primary functions in `dotR` for population size estimation are:
+
+### `dnadot_snp()`
+
+This is the main workhorse function.
+
+```R
+# Conceptual signature (refer to actual help file for full details)
+# dnadot_snp(
+#   genind_object,
+#   method = "sherwin", # or "mle"
+#   jackknife_proportion = 0.8,
+#   # Sherwin-specific parameters
+#   sherwin_discrepancy_type = "absolute_diff", # New: "absolute_diff", "neg_log_likelihood"
+#   sherwin_reg_strength = 0,                # New: Strength of regularization penalty
+#   sherwin_reg_N_threshold = Inf,           # New: N_c threshold to start applying penalty
+#   num_N_hypothesized = 11,
+#   sherwin_N_try_min = NULL, 
+#   sherwin_N_try_max = NULL, 
+#   num_p_hypothesized = 20,
+#   p_hypothesized_range = c(0.01, 0.99),
+#   # MLE-specific parameters
+#   mle_target_alleles = NULL, 
+#   num_N_for_aic = 30,        
+#   N_hypothesized_range_factor = 3, 
+#   n_cores = 1
+# )
+```
+
+**Arguments:**
+
+* `genind_object`: An object of class `genind` (from package `adegenet`) containing the SNP data.
+* `method`: Character string, either `"sherwin"` (default) or `"mle"`.
+* `jackknife_proportion`: Numeric (0 to 1). Default `0.8`.
+* **Sherwin Method Specific Arguments:**
+    * `sherwin_discrepancy_type`: Character. The type of discrepancy metric to use.
+        * `"absolute_diff"` (default): Original sum of absolute differences $\sum |O_k - E_k|$.
+        * `"neg_log_likelihood"`: Uses the negative log-likelihood of observing $O_k$ given $E_k$ (assuming a multinomial distribution for counts in bins, scaled by total jackknife samples).
+    * `sherwin_reg_strength`: Numeric. Strength of the regularization penalty applied to the discrepancy for large $N_c$. Default `0` (no regularization). A small positive value (e.g., 1e-6, 1e-5) can be tried. Only active if `sherwin_discrepancy_type = "absolute_diff"`. The penalty could be $D_{reg} = D_{abs} + \lambda \times \log(N_{try})$ for $N_{try} > N_{threshold}$.
+    * `sherwin_reg_N_threshold`: Numeric. The $N_c$ value above which the regularization penalty starts to apply. Default `Inf` (penalty effectively off).
+    * `num_N_hypothesized`: Integer. Default `11`.
+    * `sherwin_N_try_min`, `sherwin_N_try_max`: Numeric. Explicit $N_c$ (individuals) range.
+    * `num_p_hypothesized`: Integer. Default `20`.
+    * `p_hypothesized_range`: Numeric vector. Default `c(0.01, 0.99)`.
+* **MLE/AIC Method Specific Arguments:** (Details as before)
+    * `mle_target_alleles`
+    * `num_N_for_aic`
+    * `N_hypothesized_range_factor`
+* `n_cores`: Integer. Default `1`.
+
+**Output (Conceptual - depends on method):** (Details as before)
+
+### Data Input Helper Functions
+
+(Details as before: `df2genind_dotR()`, `read_vcf_to_genind_dotR()`)
+
+## Data Input and Preparation
+
+(Details as before)
+
+```{r data_prep_example, eval=FALSE}
+# (Code as before)
+```
+
+# User Guide and Examples
+
+## Example Workflow: Sherwin's DnaDot Method
+
+**1. Simulate/Load Data and Prepare `genind` Object:** (As before)
+
+**2. Run `dnadot_snp` with `method = "sherwin"`:**
+
+```{r sherwin_example_run, eval=FALSE}
+if (check_dotR_function("dnadot_snp") && exists("genind_example") && !is.null(genind_example)) {
+  
+  sample_size_example <- 50 
+  
+  # Example 1: Original Sherwin method
+  sherwin_params_orig <- list(
+    genind_object = genind_example, method = "sherwin",
+    jackknife_proportion = 0.8, num_N_hypothesized = 11,
+    sherwin_N_try_min = max(2, floor(sample_size_example * 0.8)),
+    sherwin_N_try_max = floor(sample_size_example * 3),
+    sherwin_discrepancy_type = "absolute_diff", # Original
+    sherwin_reg_strength = 0 # No regularization
+  )
+  message("Running Original Sherwin DnaDot method example...")
+  # results_sherwin_orig <- do.call(dnadot_snp, sherwin_params_orig)
+  # message("Original Sherwin Estimated Nc: ", results_sherwin_orig$N_dnadot_sherwin)
+
+  # Example 2: Sherwin method with Likelihood-based Discrepancy
+  sherwin_params_lik <- sherwin_params_orig
+  sherwin_params_lik$sherwin_discrepancy_type <- "neg_log_likelihood"
+  message("Running Sherwin DnaDot with Likelihood Discrepancy example...")
+  # results_sherwin_lik <- do.call(dnadot_snp, sherwin_params_lik)
+  # message("Sherwin (Likelihood Discrepancy) Estimated Nc: ", results_sherwin_lik$N_dnadot_sherwin)
+
+  # Example 3: Sherwin method with Regularization
+  sherwin_params_reg <- sherwin_params_orig
+  sherwin_params_reg$sherwin_reg_strength <- 1e-5 # Small penalty
+  sherwin_params_reg$sherwin_reg_N_threshold <- floor(sample_size_example * 2) # Start penalizing above 2x sample size
+  message("Running Sherwin DnaDot with Regularization example...")
+  # results_sherwin_reg <- do.call(dnadot_snp, sherwin_params_reg)
+  # message("Sherwin (Regularized) Estimated Nc: ", results_sherwin_reg$N_dnadot_sherwin)
+  
+} else {
+  message("Skipping Sherwin method example as dnadot_snp or genind_example is not available.")
+}
+```
+
+**Interpreting Sherwin Output:** (As before, note the boundary check)
+
+## Example Workflow: MLE/AIC Method
+
+(As before)
+
+```{r mle_example_run, eval=FALSE}
+# (Code as before)
+```
+
+**Interpreting MLE/AIC Output:** (As before)
+
+# Addressing Estimation Challenges and Potential Refinements
+
+Simulation studies and real-world applications may reveal challenges, such as the original Sherwin DnaDot method (using sum of absolute differences) overestimating $N_c$ when the true $N_c$ is large. This can occur because as $N_c$ increases relative to the sample size, the hypergeometric distribution behaves increasingly like the binomial distribution. In this regime, the "discrepancy surface" can become flat for large $N_c$ values, making the minimum less distinct and more susceptible to stochastic noise, potentially leading to an overestimate.
+
+The `dotR` package incorporates experimental extensions to the Sherwin method to address these observations.
+
+## A. Implemented Extensions in `dotR` for the Sherwin Method
+
+The `dnadot_snp` function, when `method = "sherwin"`, now includes parameters to control refined discrepancy calculations:
+
+1.  **Likelihood-based Discrepancy Metric (`sherwin_discrepancy_type = "neg_log_likelihood"`)**
+    * **Rationale:** Instead of minimizing the sum of absolute differences ($D_{abs} = \sum |O_k - E_k|$), this option minimizes a value derived from the multinomial log-likelihood. The observed counts of target alleles in jackknife subsamples ($O_k$, for $k=0, 1, ..., s$ target alleles) are treated as arising from a multinomial distribution. The probabilities for each bin $k$ in this multinomial distribution are taken from the expected hypergeometric proportions $E_k(N_{try}, p_{try}, s)$.
+    * **Calculation:** The function calculates $L_{multi} = \sum_{k} (\text{count_in_bin_}k \times \log(E_k))$. The value minimized is $-L_{multi}$. (Note: True multinomial likelihood involves $N_{total\_subsamples}! / (\prod O_k!) \times \prod E_k^{O_k}$. For minimization, often only $\sum O_k \log E_k$ is used as the core component if $N_{total\_subsamples}$ is constant across comparisons).
+    * **Potential Benefit:** Likelihood-based metrics can have better statistical properties and may provide a more sensitive "surface" for identifying the optimal ($N_{try}, p_{try}$), potentially reducing issues related to the flatness of the absolute difference metric at large $N_c$.
+    * **Usage:** Set `sherwin_discrepancy_type = "neg_log_likelihood"` in `dnadot_snp()`.
+
+2.  **Regularization Penalty (`sherwin_reg_strength`, `sherwin_reg_N_threshold`)**
+    * **Rationale:** To counteract the tendency of estimates to "run away" to very large $N_c$ values when the discrepancy surface is flat, a penalty term can be added to the original absolute difference discrepancy. This penalty increases with larger $N_{try}$ values, effectively making very large $N_c$ estimates less favorable unless they provide a substantially better fit to the data.
+    * **Calculation (Conceptual):** When `sherwin_discrepancy_type = "absolute_diff"`, the modified discrepancy becomes:
+        $$D'_{abs} = D_{abs} + \lambda \times f(N_{try})$$
+        where $\lambda$ is `sherwin_reg_strength`. The function $f(N_{try})$ could be, for example, $\log(N_{try})$ or $N_{try}$ itself, applied only when $N_{try}$ exceeds `sherwin_reg_N_threshold`. A logarithmic penalty is often preferred as it's less aggressive.
+    * **Potential Benefit:** Helps to stabilize estimates and prevent them from becoming unrealistically large when the data provide weak information to distinguish between large $N_c$ values.
+    * **Usage:** Set `sherwin_reg_strength` to a small positive value (e.g., `1e-6`, `1e-5`). Set `sherwin_reg_N_threshold` to an $N_c$ value above which you want the penalty to start taking effect (e.g., a few times the sample size, or a known plausible upper limit for $N_c$). This regularization is currently only implemented for `sherwin_discrepancy_type = "absolute_diff"`.
+
+These implemented refinements are experimental and their optimal parameterization (e.g., the value of `sherwin_reg_strength`) may require further investigation through simulation studies tailored to specific data characteristics.
+
+## B. Other Potential (Not Yet Implemented) Refinements & Alternatives
+
+Beyond the currently implemented options, further research could explore:
+
+1.  **Adaptive $N_{try}$ Range and Search Strategy:** (Details as in previous version of vignette)
+2.  **Refined Aggregation of Locus-Specific Estimates:** (Details as in previous version of vignette)
+3.  **Tuning Existing MLE/AIC or Considering Broader Alternatives:** (Details as in previous version of vignette, including Formal Bayesian Estimation, ABC, etc.)
+
+**Conclusion for Refinements:**
+
+The `dotR` package aims to provide robust estimation while also offering avenues for exploring methodological improvements. The implemented likelihood-based discrepancy and regularization penalty for the Sherwin method are first steps in addressing challenges observed with large population sizes. Users are encouraged to test these options and consult ongoing research.
+
+# Tips for Users 
+(Content from previous vignette version, with minor adjustments to reflect new parameters)
+
+* **Sufficient Data:** ...
+* **Sherwin `N_try` Range:** ... (mention adaptive range if not using built-in regularization).
+* **Sherwin Discrepancy and Regularization:** Experiment with `sherwin_discrepancy_type`. If using regularization (`sherwin_reg_strength > 0`), carefully choose `sherwin_reg_N_threshold` and test different `sherwin_reg_strength` values.
+* **MLE `num_N_for_aic`:** ...
+* **Interpreting CV (Sherwin):** ...
+* **Computational Time:** ...
+
+# Simulation Studies for Concordance and Validation
+(Content as in previous vignette version)
+
+## Illustrative Simulation Snippet
+(Content as in previous vignette version, perhaps add new parameters to the example call)
+
+```{r simulation_framework_example, eval=FALSE}
+# (Code as before, potentially showing new parameters in dnadot_snp call)
+# Example:
+  # results_sherwin_sim <- dnadot_snp(
+  #   genind_object = genind_sim, method = "sherwin",
+  #   jackknife_proportion = jj_prop_sim,
+  #   sherwin_N_try_min = floor(true_Nc_sim * 0.5),
+  #   sherwin_N_try_max = floor(true_Nc_sim * 1.5),
+  #   num_N_hypothesized = 11, num_p_hypothesized = 10,
+  #   sherwin_discrepancy_type = "neg_log_likelihood" # Using new option
+  # )
+```
+
+# References
+(Content as in previous vignette version)
+
+# Citing `dotR`
+(Content as in previous vignette version)
+
+# Session Info
+
+```{r session_info}
+sessionInfo()
+title: "Untitled"
+author: "Mark Richardson"
+date: "2025-05-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.

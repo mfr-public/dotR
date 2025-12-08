@@ -1,0 +1,104 @@
+title: "Estimating Population Size with the dotR Package" author: "Mark Richardson" date: "r Sys.Date()" output: html_document: toc: yes toc_float: yes number_sections: yes theme: united vignette: > %\VignetteIndexEntry{Estimating Population Size with dotR} %\VignetteEngine{knitr::rmarkdown} %\VignetteEncoding{UTF-8}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE) # eval=FALSE for CRAN checks
+# When knitting locally to see output, you can set eval = TRUE
+# Ensure dotR is loaded for knitting
+# library(dotR)
+
+Introduction
+Estimating census population size (N_c) is a fundamental task in ecology, evolution, and conservation biology. The dotR package provides a powerful suite of tools to estimate N_c from a single sample of SNP genotypes.
+
+This package now offers three distinct methodologies, allowing for robust analysis and direct comparison:
+
+Buffered Histogram Discrepancy (BHD): The new, recommended default method. It is a robust implementation inspired by the histogram comparison approach in Sherwin (2024), specifically designed to be highly stable and to avoid failures in the likelihood space that can occur with sparse or challenging data.
+
+Sherwin (2024) Method: A faithful implementation of the original DnaDot method, based on minimizing the discrepancy between observed and expected allele count histograms. This is included for direct replication and comparison with the paper's results.
+
+Maximum Likelihood Estimation (MLE): A classic likelihood-based approach, retained for comparative purposes.
+
+This vignette provides a theoretical overview, details the implementation of these methods, and offers a practical user guide with examples.
+
+Theoretical Background
+The BHD Method: A Robust Solution
+The Buffered Histogram Discrepancy (BHD) method was developed to solve a common problem in likelihood-based estimation: when an observed event (like an allele count in a subsample) has a theoretical probability of zero under a hypothesized model, the entire likelihood calculation can fail. BHD avoids this by comparing distributions instead of fragile point probabilities. For a full mathematical breakdown, please see the "Methodological Details in dotR" vignette.
+
+The Original Sherwin (2024) Method
+For direct comparison and replication of the original paper, dotR includes a faithful implementation of the DnaDot method. It works by creating a single histogram of observed allele counts from all jackknife subsamples and finding the hypothesized (N_try,p_try) pair whose theoretical hypergeometric distribution best matches it.
+
+User Guide and Examples
+1. Data Preparation
+All methods in dotR require your data to be in a genind object. You can create this from a data frame of genotypes or a VCF file using the package's helper functions.
+
+# Example: Create a genind object from a dummy data frame
+set.seed(42)
+dummy_df <- data.frame(matrix(
+  sample(c("AA", "AT", "TT"), 40 * 50, replace = TRUE), nrow = 40,
+  dimnames = list(paste0("Ind", 1:40), paste0("Locus", 1:50))
+))
+
+# Use the package's helper function
+genind_data <- df2genind_dotR(df = dummy_df, sep = "", ploidy = 2)
+print(genind_data)
+
+2. Running an Estimation
+The main function dnadot_snp acts as a dispatcher. You select the desired approach with the method argument.
+
+Example: Running the BHD Method (Recommended)
+
+This is the recommended method for most use cases due to its stability. The bhd_buffer_width parameter controls the degree of "smearing" of the observed data; the default of 1 is a good starting point.
+
+# Run the BHD estimation with a buffer width of 1
+bhd_results <- dnadot_snp(
+  genind_object = genind_data,
+  method = "bhd",
+  bhd_buffer_width = 1,
+  n_cores = 2 # Use multiple cores if available
+)
+
+cat("BHD Estimated Nc:", bhd_results$N_est_bhd, "\n")
+
+Example: Running the Original Sherwin Method
+
+To replicate the results from the 2024 paper, use method = "sherwin". You can also test the paper's refinements.
+
+# Run the original Sherwin method using the absolute difference discrepancy
+sherwin_results <- dnadot_snp(
+  genind_object = genind_data,
+  method = "sherwin",
+  sherwin_discrepancy_type = "absolute_diff", # As per paper
+  n_cores = 2
+)
+
+cat("Original Sherwin Estimated Nc:", sherwin_results$N_dnadot_sherwin, "\n")
+
+Example: Running the MLE Method
+
+The classic likelihood method can be run for comparison. It requires you to specify which alleles to target.
+
+# Run the MLE method, targeting alleles "A" and "T"
+mle_results <- dnadot_snp(
+  genind_object = genind_data,
+  method = "mle",
+  mle_target_alleles = c("A", "T"),
+  n_cores = 2
+)
+
+# Calculate an overall average from the results for each target allele
+mle_avg_N <- if(length(mle_results$mle_aic_results) > 0) {
+  mean(sapply(mle_results$mle_aic_results, `[[`, "averaged_N"), na.rm=TRUE)
+} else { NA }
+
+cat("MLE/AIC Estimated Nc:", mle_avg_N, "\n")
+
+3. Interpreting the Output
+The output for the BHD and Sherwin methods is a list containing:
+
+N_est_bhd or N_dnadot_sherwin: The final, single best estimate of census size (N_c).
+
+selected_loci_details: A data frame showing the results from the 10% of most stable analyses (based on lowest CV) that were averaged to produce the final estimate. This is useful for diagnostics.
+
+all_runs_summary: A data frame containing the raw estimates from every locus-allele combination before the CV-based selection.
+
+Crucially, always check if your estimate is hitting the boundaries of the hypothesized N range. If your final estimate is very close to N_try_min or N_try_max, you should expand the range and re-run the analysis.
+
+References
+Sherwin, W.B. (2024). DnaDot - fixing ecology and evolution's blind spot, population size. Ecological Indicators, 160, 111872.

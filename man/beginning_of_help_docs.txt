@@ -1,0 +1,175 @@
+#' dotR: Estimate Census Population Size (Nc) from SNP Data
+#'
+#' @description
+#' The `dotR` package provides a suite of Minimum Distance Estimation (MDE) methods
+#' to estimate the census size (Nc) of a population from biallelic SNP data.
+#'
+#' @details
+#' The core of the package is the `dnadot_snp()` function, which compares the
+#' observed distribution of allele counts from jackknife subsamples of the data to
+#' a theoretical expectation.
+#'
+#' The key innovation of the `dotR` package is the inclusion of the
+#' `"betabin_dynamic"` method. While standard methods assume a simple, panmictic
+#' population, the dynamic beta-binomial method is specifically designed to
+#' account for the effects of population structure (i.e., a Wahlund effect or
+#' Fis > 0). It does this by using a two-step calibration process based on
+#' Wright's Island Model to dynamically link the hypothesized Nc to the expected
+#' level of allele frequency variance.
+#'
+#' As demonstrated through extensive simulations, this method provides substantially
+#' more accurate Nc estimates in structured populations where traditional methods
+#' are known to fail.
+#'
+#' @section Key Functions:
+#' \itemize{
+#'   \item \code{\link{dnadot_snp}}: The main function for estimating Nc.
+#'   \item \code{\link{df2genind_dotR}}: A function to convert a data frame of
+#'   genotypes into the required format.
+#'   \item \code{\link{read_vcf_to_genind_dotR}}: A convenience function to load
+#'   data directly from a VCF file.
+#' }
+#'
+#' @docType package
+#' @name dotR-package
+NULL
+
+#' Estimate Census Size (Nc) from SNP data
+#'
+#' This is the main analysis function of the `dotR` package. It takes a `genind`
+#' object and applies a specified Minimum Distance Estimation (MDE) method to
+#' estimate the census population size (Nc).
+#'
+#' @details
+#' The function operates by creating many jackknife subsamples from the provided
+#' genetic data to generate an observed distribution of allele counts. It then
+#' searches over a grid of hypothesized Nc and allele frequency (p) values. For
+#' each pair, it calculates a theoretical expected distribution of allele counts.
+#' The (Nc, p) pair that minimizes the discrepancy between the observed and
+#' expected distributions is chosen as the best estimate.
+#'
+#' ### Choosing the Right Method:
+#' The choice of method is critical for obtaining an accurate estimate and depends
+#' on the likely structure of the population being studied.
+#'
+#' \strong{For Panmictic Populations (`Fis` ≈ 0):}
+#' The `wasserstein` and `bhd` methods are appropriate. They are based on the
+#' hypergeometric distribution, which assumes random mating. `wasserstein` is
+#' generally a robust and fast default in these conditions.
+#'
+#' \strong{For Structured Populations (`Fis` > 0):}
+#' When population structure, non-random mating, or a Wahlund effect is present
+#' or suspected, standard methods will severely underestimate Nc. In these common
+#' biological scenarios, the \strong{`betabin_dynamic`} method is strongly
+#' recommended. This method uses a beta-binomial distribution to model the
+#' overdispersion of allele frequencies and a calibration step based on
+#' Wright's Island Model to provide a more accurate estimate. As shown in
+#' simulations, this method is most effective when a relatively small fraction
+#' of the total population is sampled.
+#'
+#' @param genind_object A `genind` object, which must be created with
+#'   \code{\link{df2genind_dotR}} or \code{\link{read_vcf_to_genind_dotR}} to ensure
+#'   the correct internal format for the C++ backend.
+#' @param method The estimation method to use. Options are:
+#'   \itemize{
+#'     \item `"wasserstein"`: (Default) MDE using the Wasserstein distance. A robust
+#'       choice for panmictic populations.
+#'     \item `"bhd"`: Buffered Histogram Discrepancy. Another option for panmictic data.
+#'     \item `"betabin"`: MDE with a Beta-binomial model using a fixed, global Fis
+#'       calculated from the data.
+#'     \item `"betabin_dynamic"`: \strong{(Recommended for structured populations)}
+#'       MDE with a Beta-binomial model where the Fis is dynamically linked to the
+#'       hypothesized Nc.
+#'     \item `"sherwin"`: MDE using absolute difference with an optional penalty term.
+#'     \item `"nll"`: MDE using negative log-likelihood.
+#'   }
+#' @param jackknife_proportion The proportion of individuals to include in each
+#'   jackknife subsample (default: 0.8).
+#' @param num_N_hypothesized The number of Nc values to test in the grid search.
+#'   Simulations show that a finer grid (e.g., 51) provides more accurate results
+#'   than a coarser grid (e.g., 15). (Default: 51).
+#' @param N_try_min The minimum Nc value to test in the grid search. If NULL (default),
+#'   a sensible minimum is chosen automatically.
+#' @param N_try_max The maximum Nc value to test in the grid search. If NULL (default),
+#'   it is set based on the sample size and method. Simulations suggest a factor of
+#'   3x the sample size is optimal for `"betabin_dynamic"`, while 6x is a safe
+#'   default for other methods.
+#' @param n_cores The number of CPU cores to use for parallel processing across loci
+#'   (default: 1).
+#' @param ... Additional arguments passed to specific methods (e.g., `bhd_buffer_width`).
+#'
+#' @return A list containing:
+#'   \item{N_est}{The final, single estimate of Nc, averaged from the most informative loci/alleles.}
+#'   \item{selected_loci_details}{A data frame of the top 10% of locus/allele runs used to calculate the final estimate, sorted by reliability (lowest CV).}
+#'   \item{all_runs_summary}{A data frame containing the raw results from every locus/allele combination that was successfully analyzed.}
+#'   \item{method}{The name of the method used.}
+#'
+#' @seealso \code{\link{df2genind_dotR}}, \code{\link{read_vcf_to_genind_dotR}}
+#'
+#' @export
+#' @examples
+#' # --- 1. Create a sample dataset (e.g., 30 individuals, 50 loci) ---
+#' n_ind_sample <- 30
+#' n_loci_sample <- 50
+#' sample_genotypes <- data.frame(matrix(NA_character_,
+#'                                       nrow = n_ind_sample,
+#'                                       ncol = n_loci_sample))
+#' colnames(sample_genotypes) <- paste0("L", 1:n_loci_sample)
+#'
+#' for (l in 1:n_loci_sample) {
+#'   p <- runif(1, 0.1, 0.9)
+#'   probs <- c(p^2, 2*p*(1-p), (1-p)^2)
+#'   genos <- c("AA", "AT", "TT") # Using two alleles for simplicity
+#'   sample_genotypes[, l] <- sample(genos, n_ind_sample, replace = TRUE, prob = probs)
+#' }
+#'
+#' # --- 2. Convert the data frame to the required genind format ---
+#' genind_input <- df2genind_dotR(sample_genotypes, sep = "", ploidy = 2)
+#'
+#' # --- 3. Run the analysis ---
+#' # Use 'wasserstein' for this randomly generated (panmictic) data
+#' result <- dnadot_snp(genind_input, method = "wasserstein", n_cores = 1)
+#'
+#' # --- 4. View the estimate ---
+#' cat("Estimated Nc:", round(result$N_est), "\n")
+#' print(head(result$selected_loci_details))
+#'
+
+#' Convert a data frame to a custom dotR genind object
+#'
+#' @description This function is a critical pre-processing step. It converts a
+#' standard data frame of genotypes into a `genind` object with a special internal
+#' format required by the `dotR` C++ backend.
+#'
+#' @details The key difference from a standard `genind` object is that the `@tab`
+#' slot does not contain allele counts. Instead, it stores integer indices for
+#' each allele (0-based). For a diploid locus with alleles "A" and "T", a genotype
+#' of "AT" would be stored as `0 1` rather than `1 1`. This format is substantially
+#' more efficient for the C++ analysis code. All analyses in `dnadot_snp` require
+#' an object created by this function or by \code{\link{read_vcf_to_genind_dotR}}.
+#'
+#' @param df A data frame where rows are individuals and columns are loci. Genotypes
+#'   should be represented as strings (e.g., "AT", "GG").
+#' @param sep The character separating alleles within a genotype string (e.g., "/" for "A/T").
+#'   Default is "" for unseparated genotypes like "AT".
+#' @param ploidy The ploidy of the organism (default is 2).
+#' @param type The type of marker, passed to `adegenet::df2genind` (default "codom").
+#'
+#' @return A `genind` object with a custom integer-based `@tab` slot, ready for use
+#'   in \code{\link{dnadot_snp}}.
+#'
+#' @export
+
+#' Read a VCF file and convert it to a dotR genind object
+#'
+#' @description A convenience wrapper that reads a VCF file, extracts genotype
+#' information, and uses \code{\link{df2genind_dotR}} to create the custom
+#' `genind` object required by the package.
+#'
+#' @param vcf_file Path to the VCF file.
+#' @param ploidy The ploidy of the organism (default is 2).
+#'
+#' @return A `genind` object ready for use with \code{\link{dnadot_snp}}.
+#'
+#' @seealso \code{\link{df2genind_dotR}}
+#' @export
